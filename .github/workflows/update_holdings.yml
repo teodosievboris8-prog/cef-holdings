@@ -24,7 +24,8 @@ jobs:
       - name: Run holdings updater
         run: python nport_holdings_cef.py
 
-      - name: Commit results (safe)
+      - name: Commit results safely
+        shell: bash
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
