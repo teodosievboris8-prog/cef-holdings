@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: cef-holdings
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python nport_holdings_cef.py
