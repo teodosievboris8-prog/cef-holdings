@@ -1,103 +1,86 @@
-#!/usr/bin/env python3
-"""
-nport_holdings_cef.py
-
-Fetches N-PORT holdings from SEC public S3 mirror for selected tickers
-and writes output/selected_holdings.csv.
-"""
-
 import os
-import io
-import gzip
 import json
-import pandas as pd
-from tqdm import tqdm
-import boto3
-from botocore import UNSIGNED
-from botocore.client import Config
 import requests
-import base64
-import datetime
+import pandas as pd
+from datetime import datetime, timezone
+import time
 
-# -------- CONFIGURE HERE: your tickers (already set) ----------
-TICKERS = {
-    "DFP","FFC","FLC","FPF","HPF","HPI","HPS","JPC","LDP","NPFD",
-    "PDT","PFD","PFO","PSF","PTA"
-}
+# The tickers you care about
+TICKERS = ["DFP", "FFC", "FLC", "FPF", "HPF", "HPI", "HPS", "JPC", "LDP", "NPFD", "PDT", "PFD", "PFO", "PSF", "PTA"]
 
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "selected_holdings.csv")
+# Output path
+OUTPUT_FILE = "output/selected_holdings.csv"
 
-# Public S3 bucket where SEC mirrors datasets
-BUCKET = "sec-edgar"
-PREFIX = "forms/nport-p/"
+# SEC base URL
+SEC_BASE = "https://data.sec.gov/api/xbrl/company_tickers.json"
 
-# Use unsigned (no AWS credentials needed)
-s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+HEADERS = {"User-Agent": "MyResearchScript (contact@example.com)"}
 
-def list_nport_files():
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".jsonl.gz"):
-                keys.append(key)
-    return sorted(keys)
 
-def stream_s3_jsonl(bucket, key):
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    raw = obj["Body"].read()
-    # decompress gzip stream
-    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
-        for line in gz:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
+def get_cik_mapping():
+    """Map tickers to CIKs from SEC's public API"""
+    print("Fetching ticker → CIK map...")
+    r = requests.get(SEC_BASE, headers=HEADERS)
+    r.raise_for_status()
+    data = r.json()
+    mapping = {v["ticker"].upper(): str(v["cik_str"]).zfill(10) for v in data.values()}
+    return {t: mapping.get(t) for t in TICKERS if t in mapping}
+
+
+def get_latest_nport_url(cik):
+    """Find the most recent NPORT-P filing for a given CIK"""
+    feed = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    r = requests.get(feed, headers=HEADERS)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    filings = data.get("filings", {}).get("recent", {})
+    forms = list(filings.get("form", []))
+    accession = None
+    for i, f in enumerate(forms):
+        if f == "NPORT-P":
+            accession = filings["accessionNumber"][i].replace("-", "")
+            break
+    if not accession:
+        return None
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/primary_doc.xml"
+
+
+def extract_holdings_from_nport(xml_text):
+    """Extract holding names and values from NPORT XML"""
+    df = pd.read_xml(xml_text, xpath=".//invstOrSecs")
+    cols = [c for c in df.columns if "name" in c.lower() or "value" in c.lower()]
+    return df[cols]
+
 
 def extract_and_save():
-    files = list_nport_files()
-    print(f"Found {len(files)} N-PORT files to scan.")
-    rows = []
+    cik_map = get_cik_mapping()
+    all_df = []
 
-    for key in files:
-        print(f"Scanning: {key}")
-        for obj in tqdm(stream_s3_jsonl(BUCKET, key), desc=key, unit="lines"):
-            # find ticker in object (sometimes top-level or inside series)
-            ticker = (obj.get("ticker") or obj.get("series", {}).get("ticker") or "").upper()
-            if ticker not in TICKERS:
-                continue
+    for ticker, cik in cik_map.items():
+        print(f"→ Fetching {ticker} ({cik})")
+        url = get_latest_nport_url(cik)
+        if not url:
+            print(f"  ⚠️  No NPORT-P found for {ticker}")
+            continue
+        r = requests.get(url, headers=HEADERS)
+        if r.status_code != 200:
+            print(f"  ⚠️  Couldn't fetch {url}")
+            continue
+        df = extract_holdings_from_nport(r.text)
+        df["Ticker"] = ticker
+        all_df.append(df)
+        time.sleep(1)
 
-            series = obj.get("series", {})
-            holdings = series.get("holdings", [])
-            for h in holdings:
-                rows.append({
-                    "ticker": ticker,
-                    "seriesName": series.get("name") or obj.get("seriesName"),
-                    "holding_name": h.get("name"),
-                    "cusip": h.get("cusip"),
-                    "isin": h.get("isin"),
-                    "valueUSD": h.get("valueUSD"),
-                    "pctOfNAV": h.get("pctOfNAV"),
-                    "country": h.get("country"),
-                    "assetCategory": h.get("assetCategory"),
-                    "positionType": h.get("positionType") or h.get("type"),
-                    "file_source": key
-                })
+    if not all_df:
+        print("No data extracted.")
+        return
 
-    if not rows:
-        print("No holdings found for the selected tickers.")
-        return False
+    out = pd.concat(all_df)
+    os.makedirs("output", exist_ok=True)
+    out.to_csv(OUTPUT_FILE, index=False)
+    print(f"✅ Saved {len(out)} holdings to {OUTPUT_FILE}")
 
-    df = pd.DataFrame(rows)
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"✅ Saved {len(rows)} rows to {OUTPUT_FILE}")
-    return True
 
 if __name__ == "__main__":
     extract_and_save()
