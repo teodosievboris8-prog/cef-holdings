@@ -1,0 +1,36 @@
+name: Update CEF Holdings
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"  # Monthly on the 1st UTC
+  workflow_dispatch:    # Allow manual run
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run holdings updater
+        run: python nport_holdings_cef.py
+
+      - name: Commit results (safe)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f output/holdings.csv ]; then
+            git add output/holdings.csv
+            git commit -m "Auto-update holdings $(date -u +'%Y-%m-%d')" || echo "No changes"
+            git push
+          else
+            echo "No holdings.csv file generated; skipping commit"
